@@ -31,10 +31,26 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Dashboard Preview
+
+![OptionsGenie Dashboard](https://github.com/user-attachments/assets/a076540e-edf1-42b3-b211-7d90b21cf653)
+*Initial dashboard with ticker input*
+
+![Options Analysis](https://github.com/user-attachments/assets/e66df242-ea58-48c2-946f-2a028ecd2e10)
+*Complete analysis showing strategies and options data*
+
+### Running the Application
+
 1. Start the Flask web server:
 ```bash
 python3 app.py
 ```
+
+   **Note**: For testing purposes when Yahoo Finance API is not accessible (e.g., in restricted networks), use the demo version:
+```bash
+python3 app_demo.py
+```
+   The demo version uses mock data for common tickers (AAPL, MSFT, TSLA, etc.)
 
 2. Open your web browser and navigate to:
 ```

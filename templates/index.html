@@ -486,10 +486,11 @@
                 
                 grid.appendChild(card);
                 
-                // Create chart
+                // Create chart if Chart.js is available
                 setTimeout(() => {
-                    const ctx = document.getElementById(`chart${index}`);
-                    new Chart(ctx, {
+                    if (typeof Chart !== 'undefined') {
+                        const ctx = document.getElementById(`chart${index}`);
+                        new Chart(ctx, {
                         type: 'line',
                         data: {
                             labels: strategy.prices.map(p => `$${p.toFixed(0)}`),
@@ -548,6 +549,11 @@
                             }
                         }
                     });
+                    } else {
+                        // If Chart.js is not available, show a message
+                        const ctx = document.getElementById(`chart${index}`);
+                        ctx.parentElement.innerHTML = '<p style="text-align: center; color: #666; padding: 20px;">Chart visualization unavailable. Install Chart.js or check network connection.</p>';
+                    }
                 }, 100);
             });
         }
