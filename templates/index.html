@@ -334,9 +334,9 @@
         <div class="options-table-section" id="optionsTableSection">
             <h2>Available Options Contracts</h2>
             <div class="tab-container">
-                <button class="tab active" onclick="showTab('all')">All Options</button>
-                <button class="tab" onclick="showTab('calls')">Calls Only</button>
-                <button class="tab" onclick="showTab('puts')">Puts Only</button>
+                <button class="tab active" onclick="showTab('all', event)">All Options</button>
+                <button class="tab" onclick="showTab('calls', event)">Calls Only</button>
+                <button class="tab" onclick="showTab('puts', event)">Puts Only</button>
             </div>
             <div class="table-container">
                 <table id="optionsTable">
@@ -381,7 +381,7 @@
             }, 5000);
         }
         
-        function showTab(filter) {
+        function showTab(filter, event) {
             currentFilter = filter;
             const tabs = document.querySelectorAll('.tab');
             tabs.forEach(tab => tab.classList.remove('active'));

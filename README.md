@@ -46,6 +46,11 @@ pip install -r requirements.txt
 python3 app.py
 ```
 
+   **For development with debug mode**:
+```bash
+FLASK_DEBUG=true python3 app.py
+```
+
    **Note**: For testing purposes when Yahoo Finance API is not accessible (e.g., in restricted networks), use the demo version:
 ```bash
 python3 app_demo.py
