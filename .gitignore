@@ -24,3 +24,4 @@ env/
 .venv
 .DS_Store
 *.log
+positions.json
