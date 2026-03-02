@@ -449,7 +449,11 @@ def add_position():
             position['strike'] = float(data['strike'])
         except (ValueError, TypeError):
             return jsonify({'error': 'strike must be a number'}), 400
-        position['expiration'] = data['expiration']
+        try:
+            expiration_date = datetime.strptime(data['expiration'], '%Y-%m-%d')
+        except (ValueError, TypeError):
+            return jsonify({'error': 'expiration must be in YYYY-MM-DD format'}), 400
+        position['expiration'] = expiration_date.strftime('%Y-%m-%d')
 
     positions = load_positions()
     positions.append(position)
