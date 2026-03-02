@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 app = Flask(__name__)
 
 POSITIONS_FILE = 'positions.json'
+PNL_HISTORY_FILE = 'pnl_history.json'
 
 
 def load_positions():
@@ -25,6 +26,20 @@ def save_positions(positions):
     """Save positions to JSON file"""
     with open(POSITIONS_FILE, 'w') as f:
         json.dump(positions, f, indent=2)
+
+
+def load_pnl_history():
+    """Load daily P&L history from JSON file"""
+    if os.path.exists(PNL_HISTORY_FILE):
+        with open(PNL_HISTORY_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+
+def save_pnl_history(history):
+    """Save daily P&L history to JSON file"""
+    with open(PNL_HISTORY_FILE, 'w') as f:
+        json.dump(history, f, indent=2)
 
 
 def get_current_option_price(ticker, option_type, strike, expiration):
@@ -828,95 +843,20 @@ def get_positions():
             total_pnl += pnl
         result.append(pos_with_pnl)
 
-    return jsonify({'positions': result, 'totalPnl': round(total_pnl, 2)})
+    total_pnl_rounded = round(total_pnl, 2)
 
+    # Record daily P&L snapshot for day-over-day tracking
+    today = datetime.now().strftime('%Y-%m-%d')
+    history = load_pnl_history()
+    existing = next((h for h in history if h['date'] == today), None)
+    if existing:
+        existing['totalPnl'] = total_pnl_rounded
+    else:
+        history.append({'date': today, 'totalPnl': total_pnl_rounded})
+    history = sorted(history, key=lambda x: x['date'])[-90:]
+    save_pnl_history(history)
 
-@app.route('/api/positions', methods=['POST'])
-def add_position():
-    """Add a new position to track"""
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Request body is required'}), 400
-
-    required_fields = ['ticker', 'type', 'quantity', 'entryPrice']
-    for field in required_fields:
-        if field not in data:
-            return jsonify({'error': f'Missing required field: {field}'}), 400
-
-    pos_type = data['type']
-    if pos_type not in ('stock', 'call', 'put'):
-        return jsonify({'error': "type must be 'stock', 'call', or 'put'"}), 400
-
-    if pos_type in ('call', 'put'):
-        if 'strike' not in data or 'expiration' not in data:
-            return jsonify({'error': 'Options positions require strike and expiration'}), 400
-
-    try:
-        quantity = float(data['quantity'])
-        entry_price = float(data['entryPrice'])
-        if quantity <= 0 or entry_price < 0:
-            raise ValueError()
-    except (ValueError, TypeError):
-        return jsonify({'error': 'quantity must be positive and entryPrice must be non-negative'}), 400
-
-    position = {
-        'id': str(uuid.uuid4()),
-        'ticker': data['ticker'].upper().strip(),
-        'type': pos_type,
-        'quantity': quantity,
-        'entryPrice': entry_price,
-        'entryDate': datetime.now().strftime('%Y-%m-%d'),
-    }
-
-    if pos_type in ('call', 'put'):
-        try:
-            position['strike'] = float(data['strike'])
-        except (ValueError, TypeError):
-            return jsonify({'error': 'strike must be a number'}), 400
-        try:
-            expiration_date = datetime.strptime(data['expiration'], '%Y-%m-%d')
-        except (ValueError, TypeError):
-            return jsonify({'error': 'expiration must be in YYYY-MM-DD format'}), 400
-        position['expiration'] = expiration_date.strftime('%Y-%m-%d')
-
-    positions = load_positions()
-    positions.append(position)
-    save_positions(positions)
-
-    return jsonify({'success': True, 'position': position}), 201
-
-
-@app.route('/api/positions/<position_id>', methods=['DELETE'])
-def delete_position(position_id):
-    """Remove a tracked position"""
-    positions = load_positions()
-    original_count = len(positions)
-    positions = [p for p in positions if p['id'] != position_id]
-
-    if len(positions) == original_count:
-        return jsonify({'error': 'Position not found'}), 404
-
-    save_positions(positions)
-    return jsonify({'success': True})
-
-
-@app.route('/api/positions', methods=['GET'])
-def get_positions():
-    """Return all tracked positions with current price and P&L"""
-    positions = load_positions()
-    result = []
-    total_pnl = 0.0
-
-    for pos in positions:
-        current_price, pnl = calculate_position_pnl(pos)
-        pos_with_pnl = dict(pos)
-        pos_with_pnl['currentPrice'] = current_price
-        pos_with_pnl['pnl'] = pnl
-        if pnl is not None:
-            total_pnl += pnl
-        result.append(pos_with_pnl)
-
-    return jsonify({'positions': result, 'totalPnl': round(total_pnl, 2)})
+    return jsonify({'positions': result, 'totalPnl': total_pnl_rounded})
 
 
 @app.route('/api/positions', methods=['POST'])
@@ -983,6 +923,19 @@ def delete_position(position_id):
         return jsonify({'error': 'Position not found'}), 404
     save_positions(new_positions)
     return jsonify({'success': True})
+
+
+@app.route('/positions')
+def positions_page():
+    """Render dedicated positions page"""
+    return render_template('positions.html')
+
+
+@app.route('/api/positions/pnl-history', methods=['GET'])
+def get_pnl_history():
+    """Return daily P&L history for day-over-day charting"""
+    history = load_pnl_history()
+    return jsonify({'history': history})
 
 
 if __name__ == '__main__':
