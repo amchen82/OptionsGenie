@@ -1,3 +1,6 @@
+import json
+import math
+import os
 from flask import Flask, render_template, request, jsonify
 import yfinance as yf
 import pandas as pd
@@ -5,6 +8,264 @@ import numpy as np
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------------------------
+# System prompt for the AI multi-strategy options recommender
+# ---------------------------------------------------------------------------
+AI_SYSTEM_PROMPT = """You are a quantitative options strategy recommender.
+
+Your job is to analyze the provided market inputs and produce:
+
+1. A market regime summary (trend + volatility + conditions)
+2. A separate trade recommendation for EACH strategy category listed below (or explicitly mark the strategy as "NO TRADE" with a reason)
+
+You must NOT hallucinate data. Use only supplied inputs.
+
+---
+
+STRATEGY CATALOG (must output each section in this exact order):
+1. Covered Call
+2. Cash-Secured Put
+3. Bull Put Credit Spread
+4. Bear Call Credit Spread
+5. Call Debit Spread
+6. Put Debit Spread
+7. Iron Condor
+8. Calendar / Diagonal
+9. Protective Put (Hedge)
+10. Straddle / Strangle (only if risk_tolerance = high; otherwise NO TRADE)
+
+For each bucket, output:
+- Trade (legs, strikes, expiration)
+- Pricing assumptions (mid prices from bid/ask)
+- Max profit, max loss, break-even
+- Probability of profit (approx via delta, or explain if not possible)
+- Greeks exposure estimate (net delta/theta/vega directionally; numeric if possible)
+- Capital required / buying power estimate
+- Entry conditions
+- Exit plan
+- Risk summary
+- Reject conditions (why it might be invalid)
+
+If a strategy cannot be recommended under constraints, output:
+  "status": "NO_TRADE"
+  "reason": "..." (liquidity, bid-ask too wide, wrong regime, risk too high, etc.)
+
+---
+
+REQUIRED: MARKET REGIME + TREND DETECTION
+
+You must compute and output a Market Snapshot with:
+- Trend: bullish / bearish / sideways
+  Use supplied trend if present, otherwise infer from ohlc_daily:
+  * 20-day vs 50-day moving average (MA20, MA50)
+  * slope of MA20 (rising/falling)
+  * price vs MA50 (above/below)
+- Volatility Regime: high / normal / low using IV percentile and/or VIX (if provided)
+- Market Condition Label (one of):
+  * "Bull + High IV"
+  * "Bull + Low IV"
+  * "Bear + High IV"
+  * "Bear + Low IV"
+  * "Sideways + High IV"
+  * "Sideways + Low IV"
+- Key levels (if inferable from data):
+  * recent support/resistance from swing highs/lows (last ~20 bars)
+- Action Bias: premium selling favored vs premium buying favored (based on IV percentile)
+
+If the input data is insufficient to compute something, explicitly set it to null and explain why in "notes".
+
+---
+
+STRATEGY-SPECIFIC CONSTRUCTION RULES
+
+General Liquidity Filters (apply to all legs):
+Reject any leg if:
+- oi < min_open_interest OR volume < min_volume
+- bid/ask spread > max_bid_ask_spread_pct_of_mid
+
+If any necessary leg fails filters, mark the strategy NO_TRADE.
+
+DTE Selection:
+- If target_return = income: choose expirations within preferred_dte_income
+- If target_return = growth: choose expirations within preferred_dte_growth
+- If target_return = hedge: hedge DTE can be longer (30-120), prefer liquid monthlies
+
+Strike / Delta Preferences:
+- Short options: delta in preferred_short_delta_range
+- Long options: delta in preferred_long_delta_range
+  If deltas are missing, approximate using moneyness + IV + time (state clearly as approximation).
+
+Risk Controls:
+Reject a strategy if:
+- estimated max loss > capital * max_risk_per_trade_pct (unless explicitly "hedge" and user allows it)
+- unlimited risk strategy is proposed when risk_tolerance != high
+
+---
+
+CALCULATIONS REQUIRED
+
+You must compute (where applicable):
+- mid = (bid + ask) / 2
+- spread_width
+- net_credit / net_debit
+- max_profit
+- max_loss
+- break_even
+- return_on_risk = max_profit / max_loss (credit spreads/condors)
+- probability_of_profit_est:
+  * For single short option: approx = 1 - |delta| (state approximation)
+  * For spreads: approximate using short-leg delta (and note limitations)
+- buying_power_estimate:
+  * Covered call: 100 shares notional
+  * CSP: strike*100 cash reserved
+  * Credit spread: width*100 - credit*100
+  * Debit spread: debit*100
+  * Iron condor: max(widths)*100 - credit*100
+  * Long options: premium*100
+
+If you cannot compute a value due to missing inputs, set it to null and explain in "notes".
+
+---
+
+OUTPUT FORMAT (STRICT JSON)
+
+You must output a single JSON object with:
+- "market_snapshot"
+- "recommendations" (array of 10 items, one per strategy bucket, in the exact order listed)
+- "rankings" (optional): rank strategies that have "status": "TRADE" by a scoring model
+
+Market snapshot schema:
+{
+  "trend": "bullish/bearish/sideways",
+  "trend_evidence": {
+    "ma20": null,
+    "ma50": null,
+    "ma20_slope": null,
+    "price_vs_ma50": null
+  },
+  "volatility_regime": "high/normal/low",
+  "iv_percentile": 72,
+  "market_condition_label": "Bull + High IV",
+  "support_levels": [],
+  "resistance_levels": [],
+  "action_bias": "premium_selling/premium_buying/mixed",
+  "notes": ""
+}
+
+Recommendation item schema (for each strategy):
+{
+  "strategy_bucket": "Covered Call",
+  "status": "TRADE/NO_TRADE",
+  "rationale": "",
+  "legs": [
+    {"action":"SELL","type":"CALL","strike":900,"expiration":"2026-04-19","mid":12.55}
+  ],
+  "entry": {
+    "conditions": "",
+    "limit_price_logic": "use mid or better",
+    "liquidity_checks_passed": true
+  },
+  "metrics": {
+    "net_credit_debit": 0,
+    "max_profit": 0,
+    "max_loss": 0,
+    "break_even": 0,
+    "probability_of_profit_est": 0,
+    "return_on_risk": null,
+    "buying_power_estimate": 0
+  },
+  "greeks_profile": {
+    "delta": null,
+    "theta": null,
+    "vega": null,
+    "notes": "directional exposure summary if exact netting not possible"
+  },
+  "exit_plan": {
+    "profit_take": "e.g., close at 50% of credit",
+    "stop_loss": "e.g., close if loss reaches 2x credit",
+    "time_stop": "e.g., close at 7 DTE",
+    "adjustments": "roll, convert, hedge, etc."
+  },
+  "risk_summary": "",
+  "reject_reasons": []
+}
+
+---
+
+RANKING MODEL (OPTIONAL BUT PREFERRED)
+
+If 2+ strategies produce valid trades, include "rankings" using a score:
+- For income: weight theta, POP, liquidity, return on risk
+- For growth: weight delta exposure, payoff asymmetry, cost
+- For hedge: weight downside protection per $ spent
+
+Return top 3 strategies with short justification.
+
+---
+
+BEHAVIOR RULES
+
+- You are a risk manager first.
+- Do not recommend trades that violate constraints.
+- Do not output anything other than strict JSON.
+- If inputs are incomplete, produce best-effort output with explicit nulls and notes.
+- Avoid overly complex multi-leg structures beyond the catalog.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Black-Scholes Greeks (no scipy dependency)
+# ---------------------------------------------------------------------------
+
+# Default IV assumption when market data reports 0 or invalid values.
+# 30 % is a conservative mid-range assumption for liquid large-cap options.
+_DEFAULT_IV_FALLBACK = 0.30
+
+
+def _norm_cdf(x):
+    """Standard normal CDF using math.erf"""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def _norm_pdf(x):
+    """Standard normal PDF"""
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def bs_greeks(S, K, T, r, sigma, option_type='call'):
+    """Return Black-Scholes Greeks for a European option.
+
+    Returns a dict with delta, gamma, theta, vega; all None on invalid inputs.
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return {'delta': None, 'gamma': None, 'theta': None, 'vega': None}
+    try:
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        n_d1 = _norm_pdf(d1)
+        if option_type == 'call':
+            delta = _norm_cdf(d1)
+            theta = (
+                -S * n_d1 * sigma / (2.0 * math.sqrt(T))
+                - r * K * math.exp(-r * T) * _norm_cdf(d2)
+            ) / 365.0
+        else:
+            delta = _norm_cdf(d1) - 1.0
+            theta = (
+                -S * n_d1 * sigma / (2.0 * math.sqrt(T))
+                + r * K * math.exp(-r * T) * _norm_cdf(-d2)
+            ) / 365.0
+        gamma = n_d1 / (S * sigma * math.sqrt(T))
+        vega = S * n_d1 * math.sqrt(T) / 100.0  # per 1 % IV move
+        return {
+            'delta': round(delta, 4),
+            'gamma': round(gamma, 4),
+            'theta': round(theta, 4),
+            'vega': round(vega, 4),
+        }
+    except (ValueError, ZeroDivisionError):
+        return {'delta': None, 'gamma': None, 'theta': None, 'vega': None}
 
 class OptionsAnalyzer:
     """Class to analyze options data and calculate strategy payoffs"""
@@ -320,7 +581,172 @@ def get_options(ticker):
     except Exception as e:
         return jsonify({'error': f'Error processing request: {str(e)}'}), 500
 
+@app.route('/api/market-data/<ticker>')
+def get_market_data_for_ai(ticker):
+    """Return a structured payload ready for the AI recommendation engine.
+
+    Includes OHLC history, SPY trend, VIX, option chain with BS Greeks,
+    and historical volatility.
+    """
+    try:
+        ticker = ticker.upper()
+        analyzer = OptionsAnalyzer(ticker)
+        stock = analyzer.stock
+
+        current_price = analyzer.get_current_price()
+        if current_price is None:
+            return jsonify({'error': 'Unable to fetch stock price'}), 400
+
+        # OHLC (last 60 trading days)
+        hist = stock.history(period='60d')
+        ohlc_daily = [
+            {
+                'date': date.strftime('%Y-%m-%d'),
+                'open': round(float(row['Open']), 2),
+                'high': round(float(row['High']), 2),
+                'low': round(float(row['Low']), 2),
+                'close': round(float(row['Close']), 2),
+                'volume': int(row['Volume']),
+            }
+            for date, row in hist.iterrows()
+        ]
+
+        # VIX level
+        try:
+            vix_hist = yf.Ticker('^VIX').history(period='1d')
+            vix_level = round(float(vix_hist['Close'].iloc[-1]), 2) if not vix_hist.empty else None
+        except Exception:
+            vix_level = None
+
+        # SPY trend (20-day vs 50-day MA)
+        try:
+            spy_hist = yf.Ticker('SPY').history(period='60d')
+            if len(spy_hist) >= 20:
+                spy_ma20 = float(spy_hist['Close'].tail(20).mean())
+                spy_ma50 = float(spy_hist['Close'].tail(50).mean()) if len(spy_hist) >= 50 else spy_ma20
+                spy_current = float(spy_hist['Close'].iloc[-1])
+                if spy_current > spy_ma20 and spy_ma20 > spy_ma50:
+                    spy_trend = 'up'
+                elif spy_current < spy_ma20 and spy_ma20 < spy_ma50:
+                    spy_trend = 'down'
+                else:
+                    spy_trend = 'sideways'
+            else:
+                spy_trend = 'sideways'
+        except Exception:
+            spy_trend = 'sideways'
+
+        # 20-day historical volatility (annualised)
+        hv = None
+        if len(hist) >= 21:
+            log_returns = np.log(hist['Close'] / hist['Close'].shift(1)).dropna().tail(20)
+            hv = round(float(log_returns.std() * np.sqrt(252)), 4)
+
+        # Option chain with BS Greeks (strikes within ±25 % of current price)
+        risk_free_rate = 0.04
+        expirations = stock.options
+        if not expirations:
+            return jsonify({'error': 'No options data available for this ticker'}), 400
+
+        option_chain = []
+        for exp_date in expirations[:4]:
+            opt = stock.option_chain(exp_date)
+            dte = (pd.to_datetime(exp_date) - pd.Timestamp.now()).days
+            T = max(dte / 365.0, 0.001)
+
+            for option_type, chain_df in [('call', opt.calls), ('put', opt.puts)]:
+                for _, row in chain_df.iterrows():
+                    if abs(row['strike'] - current_price) / current_price > 0.25:
+                        continue
+                    iv = float(row['impliedVolatility']) if float(row['impliedVolatility']) > 0 else _DEFAULT_IV_FALLBACK
+                    greeks = bs_greeks(current_price, float(row['strike']), T, risk_free_rate, iv, option_type)
+                    option_chain.append({
+                        'expiration': exp_date,
+                        'strike': float(row['strike']),
+                        'type': option_type,
+                        'bid': float(row['bid']),
+                        'ask': float(row['ask']),
+                        'delta': greeks['delta'],
+                        'gamma': greeks['gamma'],
+                        'theta': greeks['theta'],
+                        'vega': greeks['vega'],
+                        'oi': int(row['openInterest']) if pd.notna(row['openInterest']) else 0,
+                        'volume': int(row['volume']) if pd.notna(row['volume']) else 0,
+                        'iv': round(iv, 4),
+                    })
+
+        # Approximate IV percentile from ATM IV vs HV ratio
+        iv_percentile = None
+        atm_iv = next(
+            (o['iv'] for o in option_chain
+             if o['type'] == 'call' and abs(o['strike'] - current_price) / current_price < 0.02),
+            None,
+        )
+        if atm_iv and hv:
+            # Heuristic approximation: ratio of ATM IV to realised HV, capped at 100.
+            # A true IV percentile requires a historical IV time-series; use this proxy
+            # to give the AI a rough sense of relative richness/cheapness.
+            iv_percentile = min(100, int(atm_iv / (hv + 1e-6) * 50))
+
+        payload = {
+            'ticker': ticker,
+            'stock_price': round(current_price, 2),
+            'ohlc_daily': ohlc_daily,
+            'market_index_context': {
+                'spy_trend': spy_trend,
+                'vix_level': vix_level,
+            },
+            'implied_volatility_percentile': iv_percentile,
+            'historical_volatility': hv,
+            'risk_free_rate': risk_free_rate,
+            'dividend_yield': 0.0,
+            'option_chain': option_chain,
+        }
+        return jsonify(payload)
+
+    except Exception as e:
+        return jsonify({'error': f'Error fetching market data: {str(e)}'}), 500
+
+
+@app.route('/api/recommend', methods=['POST'])
+def get_ai_recommendations():
+    """Call the OpenAI API with the multi-strategy system prompt and return JSON recommendations."""
+    try:
+        from openai import OpenAI  # lazy import; openai is optional
+
+        api_key = os.environ.get('OPENAI_API_KEY')
+        if not api_key:
+            return jsonify({
+                'error': 'OpenAI API key not configured. '
+                         'Set the OPENAI_API_KEY environment variable to enable AI recommendations.'
+            }), 503
+
+        payload = request.get_json(silent=True)
+        if not payload:
+            return jsonify({'error': 'Invalid or missing JSON payload'}), 400
+
+        for field in ('ticker', 'stock_price', 'option_chain'):
+            if field not in payload:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+
+        client = OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model='gpt-4o',
+            messages=[
+                {'role': 'system', 'content': AI_SYSTEM_PROMPT},
+                {'role': 'user', 'content': json.dumps(payload)},
+            ],
+            response_format={'type': 'json_object'},
+            temperature=0.1,
+        )
+        result = json.loads(response.choices[0].message.content)
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({'error': f'Error getting AI recommendations: {str(e)}'}), 500
+
+
+
 if __name__ == '__main__':
-    import os
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(debug=debug_mode, host='0.0.0.0', port=5000)
